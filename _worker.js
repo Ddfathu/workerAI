@@ -1,9 +1,4 @@
-// ====================================================================
-// WORKER V7 - EFISIENSI MAKSIMAL (dengan KV Storage)
-// ====================================================================
-
 const WORKER_URLS = [
-  // ... (daftar URL tetap sama, tidak diubah)
   'cf.bebas11.workers.dev', 'cf.bebas9.workers.dev', 'avaritia.elvinrakus.workers.dev',
   'urv-worker-cf.renaldisch.workers.dev', 'cf.buatvpn.workers.dev', 'cf.kebal1.workers.dev',
   'cf.osianne23.workers.dev', 'wibu.wibucf6.workers.dev', 'cf.yeyay736.workers.dev',
@@ -98,320 +93,52 @@ const WORKER_URLS = [
   'id10.kbl.ccwu.cc', 'id11.kbl.ccwu.cc', 'id12.kbl.ccwu.cc', 'id13.kbl.ccwu.cc',
   'id14.kbl.ccwu.cc', 'id15.kbl.ccwu.cc', 'id16.kbl.ccwu.cc', 'id17.kbl.ccwu.cc',
   'id18.kbl.ccwu.cc', 'id19.kbl.ccwu.cc', 'id20.kbl.ccwu.cc', 'id21.kbl.ccwu.cc'
-  // ... (silahkan salin semua URL dari file asli)
 ];
 
-// ==================== KONFIGURASI ====================
-const CACHE_KEY = 'worker_stats_v7';
-const KV_TTL_SECONDS = 300; // TTL 5 menit, sesuaikan
-const DEFAULT_SCORE = 100;
-const MAX_CONSECUTIVE_FAILURES = 3;
-const COOLDOWN_SECONDS = 60;
-const MIN_TIMEOUT = 2000;
-const MAX_TIMEOUT = 10000;
-const INITIAL_BATCH_SIZE = 3;
-const MAX_BATCH_SIZE = 6;
-
-// ---- Parameter fitur ----
-const EWMA_ALPHA = 0.3;
-const SUCCESS_RATE_WINDOW = 20;
-const PREDICTIVE_SCORE_WEIGHT = 0.4;
-const JITTER_PENALTY_THRESHOLD = 500;
-const BLACKLIST_SCORE_THRESHOLD = 20;
-const BLACKLIST_DURATION = 120;          // detik
-const RECOVERY_INTERVAL = 30;
-const P95_PERCENTILE = 0.95;
-const LATENCY_HISTORY_SIZE = 30;
-
-// ---- Circuit Breaker Global ----
-const GLOBAL_ERROR_WINDOW = 60;           // detik
-const GLOBAL_ERROR_THRESHOLD = 0.5;       // 50% error rate
-const CACHE_WRITE_BATCH = 5;              // tulis ke cache setiap N request
-
-// ==================== EKSPOR FETCH ====================
 export default {
   async fetch(request, env, ctx) {
-    // [KV] Gunakan binding KV
-    const kv = env.WORKER_STATS;
-    if (!kv) {
-      return new Response('KV binding tidak ditemukan.', { status: 500 });
+    // 1. TETAP TRIGGER JALUR TOL AI DI LATAR BELAKANG
+    try {
+      ctx.waitUntil(
+        env.AI.run('@cf/meta/llama-3-8b-instruct', {
+          prompt: "ping",
+          max_tokens: 1
+        }).catch(() => {})
+      );
+    } catch (e) {
+      // Abaikan jika binding error, sistem tetap jalan
     }
 
-    // Ambil / inisialisasi stats
-    let workerStats = await getWorkerStats(kv);
-    if (!workerStats) {
-      workerStats = initializeStats(WORKER_URLS);
-    }
+    // 2. CEK LOGIKA WEBSOCKET (Wajib untuk VLESS/VMESS/SSH WebSocket)
+    const upgradeHeader = request.headers.get('Upgrade');
+    if (upgradeHeader && upgradeHeader.toLowerCase() === 'websocket') {
+      
+      // Kocok daftar ratusan worker cadangan
+      const shuffled = [...WORKER_URLS].sort(() => Math.random() - 0.5);
+      const parsedUrl = new URL(request.url);
+      const urlPathAndQuery = parsedUrl.pathname + parsedUrl.search;
 
-    const now = Date.now();
-    // Filter worker yang tidak dalam cooldown dan tidak di-blacklist
-    const available = workerStats.filter(s => 
-      s.cooldownUntil <= now && !s.blacklisted
-    );
-    if (available.length === 0) {
-      return new Response('Semua worker sedang cooldown/blacklist. Coba lagi nanti.', { status: 503 });
-    }
+      // Coba satu-satu sampai ketemu yang aktif jaringannya
+      for (const targetHost of shuffled) {
+        try {
+          const targetUrl = `https://${targetHost}${urlPathAndQuery}`;
 
-    // ========== 1. SMART RANKING ==========
-    available.forEach(worker => {
-      const latencyScore = worker.ewmaLatency > 0 
-        ? Math.max(0, 100 - (worker.ewmaLatency / 50))
-        : 50;
-      const successRate = worker.successRate || 0.5;
-      const successScore = successRate * 100;
-      const predictive = (latencyScore * 0.6 + successScore * 0.4) * (1 - PREDICTIVE_SCORE_WEIGHT)
-                       + (worker.predictiveScore || 50) * PREDICTIVE_SCORE_WEIGHT;
-      const jitterPenalty = (worker.jitter > JITTER_PENALTY_THRESHOLD) 
-        ? Math.min(30, (worker.jitter - JITTER_PENALTY_THRESHOLD) / 50) 
-        : 0;
-      let finalScore = Math.min(100, Math.max(0, predictive - jitterPenalty));
-      if (worker.recoveryUntil && worker.recoveryUntil > now) {
-        finalScore = Math.min(100, finalScore + 10);
-      }
-      worker.score = finalScore;
-      worker.predictiveScore = predictive;
-    });
+          const response = await fetch(targetUrl, {
+            headers: request.headers,
+            redirect: 'manual'
+          });
 
-    // ========== 2. CIRCUIT BREAKER GLOBAL ==========
-    const globalErrors = workerStats.reduce((sum, w) => {
-      const recent = w.errorTimestamps ? w.errorTimestamps.filter(t => t > now - GLOBAL_ERROR_WINDOW * 1000) : [];
-      return sum + recent.length;
-    }, 0);
-    const globalTotal = workerStats.reduce((sum, w) => sum + (w.totalRequests || 0), 0);
-    const globalErrorRate = globalTotal > 0 ? globalErrors / globalTotal : 0;
-    const circuitOpen = globalErrorRate > GLOBAL_ERROR_THRESHOLD;
-
-    let effectiveBatchSize = circuitOpen ? Math.max(1, Math.floor(INITIAL_BATCH_SIZE / 2)) : INITIAL_BATCH_SIZE;
-
-    // ========== 3. PILIH TOP WORKER ==========
-    const sorted = [...available].sort((a, b) => b.score - a.score);
-    const topWorkers = sorted.slice(0, Math.min(MAX_BATCH_SIZE, sorted.length));
-
-    const latencies = topWorkers.map(w => w.ewmaLatency).filter(l => l > 0);
-    const avgLatency = latencies.length > 0 ? latencies.reduce((a, b) => a + b, 0) / latencies.length : 3000;
-
-    let batchSize = effectiveBatchSize;
-    if (topWorkers.length > 10 && avgLatency < 2000) {
-      batchSize = Math.min(MAX_BATCH_SIZE, Math.floor(topWorkers.length / 2));
-    } else if (topWorkers.length > 5) {
-      batchSize = effectiveBatchSize;
-    } else {
-      batchSize = Math.min(effectiveBatchSize, topWorkers.length);
-    }
-    batchSize = Math.max(1, batchSize);
-
-    // ========== 4. INTELLIGENT TIMEOUT (P95) ==========
-    const allLatencies = [];
-    topWorkers.forEach(w => {
-      if (w.latencyHistory && w.latencyHistory.length > 0) {
-        allLatencies.push(...w.latencyHistory);
-      }
-    });
-    let p95 = avgLatency * 1.5 + 1000;
-    if (allLatencies.length > 10) {
-      const sortedLat = [...allLatencies].sort((a, b) => a - b);
-      const idx = Math.floor(sortedLat.length * P95_PERCENTILE);
-      p95 = sortedLat[Math.min(idx, sortedLat.length - 1)];
-    }
-    let timeout = circuitOpen 
-      ? Math.min(MAX_TIMEOUT, Math.max(MIN_TIMEOUT, p95 + 200)) 
-      : Math.min(MAX_TIMEOUT, Math.max(MIN_TIMEOUT, p95 + 500));
-    timeout = Math.round(timeout);
-
-    // Siapkan headers & path
-    const parsedUrl = new URL(request.url);
-    const urlPathAndQuery = parsedUrl.pathname + parsedUrl.search;
-    const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
-    const modifiedHeaders = new Headers(request.headers);
-    modifiedHeaders.set('Connection', 'keep-alive');
-    if (!modifiedHeaders.has('Accept-Encoding')) {
-      modifiedHeaders.set('Accept-Encoding', 'gzip, deflate, br');
-    }
-
-    // ========== 5. LOOP BATCH DENGAN ABORT ==========
-    let lastError = null;
-    let successResponse = null;
-    let successController = null;
-
-    for (let i = 0; i < topWorkers.length; i += batchSize) {
-      const batch = topWorkers.slice(i, i + batchSize);
-      const batchPromises = batch.map((worker) => {
-        const controller = new AbortController();
-        const startTime = performance.now();
-
-        const promise = (async () => {
-          try {
-            const targetUrl = `https://${worker.url}${urlPathAndQuery}`;
-            const reqClone = hasBody ? request.clone() : request;
-            const modifiedRequest = new Request(targetUrl, {
-              method: request.method,
-              headers: modifiedHeaders,
-              body: hasBody ? reqClone.body : null,
-              redirect: 'manual',
-              signal: controller.signal
-            });
-
-            const response = await fetch(modifiedRequest);
-            const latency = performance.now() - startTime;
-
-            if (response.status === 429 || response.status >= 500) {
-              throw new Error(`Status ${response.status}`);
-            }
-
-            updateWorkerStats(worker, true, latency, response.status, now);
-            return { worker, response, controller };
-          } catch (err) {
-            const latency = performance.now() - startTime;
-            updateWorkerStats(worker, false, 0, 0, now);
-            if (!worker.errorTimestamps) worker.errorTimestamps = [];
-            worker.errorTimestamps.push(now);
-            throw err;
+          // Jika server target sukses merespons handshake WebSocket (Status 101)
+          if (response.status === 101) {
+            return response;
           }
-        })();
-
-        return { promise, controller, worker };
-      });
-
-      try {
-        const result = await Promise.any(batchPromises.map(p => p.promise));
-        batchPromises.forEach(p => {
-          if (p.controller !== result.controller) {
-            p.controller.abort();
-          }
-        });
-        successResponse = result.response;
-        successController = result.controller;
-        break;
-      } catch (err) {
-        lastError = err;
-        batchPromises.forEach(p => p.controller.abort());
-        continue;
+        } catch (err) {
+          continue; // Jika worker tujuan limit/mati, lempar ke target acak berikutnya
+        }
       }
     }
 
-    // ========== 6. SIMPAN STATS KE KV (dengan TTL) ==========
-    // Gunakan counter global untuk mengurangi frekuensi penulisan
-    if (!globalThis.__writeCounter) globalThis.__writeCounter = 0;
-    globalThis.__writeCounter++;
-    if (globalThis.__writeCounter % CACHE_WRITE_BATCH === 0 || successResponse === null) {
-      ctx.waitUntil(saveWorkerStats(kv, workerStats));
-    } else {
-      ctx.waitUntil(saveWorkerStats(kv, workerStats));
-    }
-
-    if (successResponse) {
-      return successResponse;
-    }
-
-    return new Response('Semua worker gagal. Coba lagi nanti.', { status: 503 });
+    // 3. RESPONS FALLBACK: Jika diakses biasa lewat browser (bukan lewat VPN)
+    return new Response('Jalur Tol Worker AI Sukses Aktif, Bos!', { status: 200 });
   }
 };
-
-// ==================== FUNGSI PEMBANTU ====================
-
-// [KV] Fungsi get dan save menggunakan KV binding
-async function getWorkerStats(kv) {
-  try {
-    const data = await kv.get(CACHE_KEY, 'json');
-    return data;
-  } catch (_) {
-    return null;
-  }
-}
-
-async function saveWorkerStats(kv, stats) {
-  try {
-    const now = Date.now();
-    stats.forEach(w => {
-      if (w.errorTimestamps) {
-        w.errorTimestamps = w.errorTimestamps.filter(t => t > now - GLOBAL_ERROR_WINDOW * 1000);
-        if (w.errorTimestamps.length === 0) delete w.errorTimestamps;
-      }
-    });
-    await kv.put(CACHE_KEY, JSON.stringify(stats), { expirationTtl: KV_TTL_SECONDS });
-  } catch (_) {
-    // ignore
-  }
-}
-
-function initializeStats(urls) {
-  return urls.map(url => ({
-    url,
-    score: DEFAULT_SCORE,
-    consecutiveFailures: 0,
-    cooldownUntil: 0,
-    ewmaLatency: 0,
-    successRate: 1.0,
-    totalRequests: 0,
-    successCount: 0,
-    lastUpdated: Date.now(),
-    predictiveScore: 50,
-    jitter: 0,
-    latencyHistory: [],
-    blacklisted: false,
-    blacklistUntil: 0,
-    recoveryUntil: 0,
-    errorTimestamps: [],
-  }));
-}
-
-function updateWorkerStats(worker, success, latency, status, now) {
-  worker.totalRequests++;
-  if (success) {
-    worker.successCount++;
-    if (worker.ewmaLatency === 0) {
-      worker.ewmaLatency = latency;
-    } else {
-      worker.ewmaLatency = worker.ewmaLatency * (1 - EWMA_ALPHA) + latency * EWMA_ALPHA;
-    }
-    if (!worker.latencyHistory) worker.latencyHistory = [];
-    worker.latencyHistory.push(latency);
-    if (worker.latencyHistory.length > LATENCY_HISTORY_SIZE) {
-      worker.latencyHistory.shift();
-    }
-    if (worker.latencyHistory.length > 2) {
-      const avg = worker.latencyHistory.reduce((a, b) => a + b, 0) / worker.latencyHistory.length;
-      const variance = worker.latencyHistory.reduce((a, b) => a + (b - avg) ** 2, 0) / worker.latencyHistory.length;
-      worker.jitter = Math.sqrt(variance);
-    } else {
-      worker.jitter = 0;
-    }
-    worker.consecutiveFailures = 0;
-    worker.cooldownUntil = 0;
-    if (worker.blacklisted) {
-      worker.blacklisted = false;
-      worker.blacklistUntil = 0;
-      worker.recoveryUntil = now + RECOVERY_INTERVAL * 1000;
-    }
-    if (worker.recoveryUntil > now) {
-      worker.score = Math.min(100, worker.score + 2);
-    } else {
-      worker.recoveryUntil = 0;
-    }
-    const currentRate = worker.successCount / worker.totalRequests;
-    worker.successRate = worker.successRate * 0.9 + currentRate * 0.1;
-    const latencyScore = worker.ewmaLatency > 0 
-      ? Math.max(0, 100 - (worker.ewmaLatency / 50))
-      : 50;
-    const successScore = worker.successRate * 100;
-    worker.predictiveScore = latencyScore * 0.6 + successScore * 0.4;
-  } else {
-    worker.consecutiveFailures++;
-    worker.score = Math.max(0, worker.score - 10);
-    if (worker.score < BLACKLIST_SCORE_THRESHOLD || worker.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-      worker.blacklisted = true;
-      worker.blacklistUntil = now + BLACKLIST_DURATION * 1000;
-      worker.cooldownUntil = worker.blacklistUntil;
-      worker.score = Math.min(worker.score, BLACKLIST_SCORE_THRESHOLD - 1);
-    } else {
-      if (worker.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-        worker.cooldownUntil = now + COOLDOWN_SECONDS * 1000;
-      }
-    }
-    const currentRate = worker.successCount / worker.totalRequests;
-    worker.successRate = worker.successRate * 0.9 + currentRate * 0.1;
-  }
-  worker.lastUpdated = now;
-}
-
-// (Fungsi passive health check dapat diabaikan atau disesuaikan jika diperlukan)
